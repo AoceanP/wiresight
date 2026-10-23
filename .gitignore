@@ -1,0 +1,10 @@
+build/
+cmake-build-*/
+.idea/
+.vs/
+out/
+
+# captures can contain private traffic; never commit them
+*.pcap
+*.pcapng
+capture*.txt
