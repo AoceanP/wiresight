@@ -47,7 +47,16 @@ Wireshark already exists. wiresight exists to understand **how packet analysis w
 | Loading a DLL safely at run time | `pcapApi()` in `capture.cpp` |
 | Testing hostile input | 49 tests, including every possible truncation of real packets |
 
-It pairs with [portscout](https://github.com/AoceanP/portscout): **portscout sends the probes, wiresight shows the packets**.
+### How it fits with my other projects
+
+Each project looks at the same network from a different side:
+
+| Project | Language | View | Question it answers |
+|---|---|---|---|
+| [**portscout**](https://github.com/AoceanP/portscout) | Java 21 | the attacker's view | What ports are open, and what is running behind them? |
+| **wiresight** (this one) | C++20 | the network's view | What is actually on the wire? |
+
+They work together: **portscout sends the probes, wiresight shows the packets**. Run wiresight on the loopback adapter while portscout scans, and you can watch a closed port answer `SYN` with `RST`, an open one complete the three-way handshake, and portscout's 19-byte banner probe; see [Example: watching portscout](#example-watching-portscout) below.
 
 ## Setup
 
