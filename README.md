@@ -101,6 +101,7 @@ Pick the interface number from `--list`. On Windows, Npcap lets normal users cap
 
 ### Troubleshooting
 
+- **The program exits with no output at all (exit code `-1073741515`, `0xC0000135`):** Windows could not find `libwinpthread-1.dll`, a MinGW runtime file. The build copies it next to `wiresight.exe`; if you moved the program, move the DLL with it.
 - **`Npcap is not installed`:** install Npcap from npcap.com, or Wireshark, which includes it.
 - **`Npcap SDK not found, so only the tests are built`:** the SDK path is wrong; it must be the folder that contains `Include/pcap.h`.
 - **No packets on loopback:** pick the interface named *Adapter for loopback traffic capture*; Npcap must have been installed with loopback support.

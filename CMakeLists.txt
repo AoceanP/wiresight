@@ -28,10 +28,23 @@ add_library(wiresight_core STATIC
 )
 target_include_directories(wiresight_core PUBLIC src)
 
-# MinGW programs otherwise need libstdc++ and libgcc DLLs from the compiler folder at run time
+# MinGW programs need libstdc++, libgcc and libwinpthread at run time, and exit
+# silently (no error message) on machines where those DLLs are not on the PATH.
+# libstdc++ and libgcc are linked in; libwinpthread cannot be linked statically
+# with every MinGW build, so its DLL is copied next to each program instead.
 if(MINGW)
 	set(STATIC_RUNTIME -static-libgcc -static-libstdc++)
+	get_filename_component(MINGW_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+	set(WINPTHREAD_DLL "${MINGW_BIN}/libwinpthread-1.dll")
 endif()
+
+# Copies the MinGW thread DLL beside a program, where Windows looks first.
+function(copy_mingw_runtime target)
+	if(MINGW AND EXISTS "${WINPTHREAD_DLL}")
+		add_custom_command(TARGET ${target} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${WINPTHREAD_DLL}" "$<TARGET_FILE_DIR:${target}>")
+	endif()
+endfunction()
 
 enable_testing()
 add_executable(wiresight_tests
@@ -45,6 +58,7 @@ add_executable(wiresight_tests
 )
 target_link_libraries(wiresight_tests PRIVATE wiresight_core)
 target_link_options(wiresight_tests PRIVATE ${STATIC_RUNTIME})
+copy_mingw_runtime(wiresight_tests)
 add_test(NAME wiresight_tests COMMAND wiresight_tests)
 
 # The capture program needs the pcap headers. On Windows they come from the
@@ -75,6 +89,7 @@ if(HAVE_PCAP)
 	target_include_directories(wiresight PRIVATE "${PCAP_INCLUDE}")
 	target_link_libraries(wiresight PRIVATE wiresight_core)
 	target_link_options(wiresight PRIVATE ${STATIC_RUNTIME})
+	copy_mingw_runtime(wiresight)
 	if(NOT WIN32)
 		target_link_libraries(wiresight PRIVATE "${PCAP_LIBRARY}")
 	endif()
