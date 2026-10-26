@@ -52,7 +52,7 @@ Wireshark already exists. wiresight exists to understand **how packet analysis w
 | Loading a DLL safely at run time | `pcapApi()` in `capture.cpp` |
 | Detecting a port scan in a sliding window | `scan.cpp` |
 | Pixel art in a terminal: half blocks and 24-bit colour | `watch.cpp` |
-| Testing hostile input | 63 tests, including every possible truncation of real packets |
+| Testing hostile input | 64 tests, including every possible truncation of real packets |
 
 ### Part of a project series
 
@@ -106,7 +106,7 @@ On Linux, leave out `-DNPCAP_SDK_DIR`. You can also set an `NPCAP_SDK` environme
 build/wiresight_tests
 ```
 
-It ends with `63 of 63 tests passed`.
+It ends with `64 of 64 tests passed`.
 
 ### 5. Capture
 
@@ -250,7 +250,7 @@ Both diagrams are drawn in draw.io: [wiresight-flow.drawio](docs/wiresight-flow.
 
 ## Tests
 
-63 tests in `tests/`, built from real packets written byte by byte, using a small test framework with no downloads. They need no network card, Npcap or admin rights.
+64 tests in `tests/`, built from real packets written byte by byte, using a small test framework with no downloads. They need no network card, Npcap or admin rights.
 
 | File | What it covers |
 |---|---|

@@ -244,7 +244,9 @@ TEST(watchFrameHasFixedHeightAndShowsTheScan)
 	CHECK(frame.find("12,345 packets") != std::string::npos);
 	CHECK(frame.find("203.0.113.7") != std::string::npos);
 	CHECK(frame.find("198.51.100.20") != std::string::npos);
-	CHECK(frame.find("probed 4 of 1024") != std::string::npos);
+	CHECK(frame.find("4 / 1,024") != std::string::npos);
+	CHECK(frame.find("OPEN 1") != std::string::npos);
+	CHECK(frame.find("SYN probes → 4") != std::string::npos);
 	CHECK(frame.find("22 ssh") != std::string::npos);
 	CHECK(frame.find("PORT SCAN") != std::string::npos);
 }
@@ -257,6 +259,38 @@ TEST(watchFrameWithNothingSeen)
 	CHECK_EQ(static_cast<int>(std::count(frame.begin(), frame.end(), '\n')), WATCH_LINES);
 	CHECK(frame.find("no scan detected") != std::string::npos);
 	CHECK(frame.find("no TCP connection attempts seen yet") != std::string::npos);
+}
+
+TEST(watchFrameEdgesLineUp)
+{
+	// every framed line (title to bottom border) is 78 columns, so the box's right edge is straight
+	const std::vector<DemoPacket> packets = scanDemo();
+	ScanDetector detector;
+	WatchStatus status;
+	status.sourceLabel = "DEMO";
+	for (const DemoPacket& demo : packets)
+	{
+		const DecodedPacket packet = decode(Bytes(demo.frame), LinkType::Ethernet, demo.frame.size());
+		if (auto alert = detector.observe(packet, demo.offsetMicros))
+		{
+			status.alert = alert;
+		}
+		++status.packets;
+	}
+	for (const ScanTrack* track : {static_cast<const ScanTrack*>(nullptr), detector.busiest()})
+	{
+		const std::string frame = visible(renderWatch(track, status, 1));
+		std::size_t start = 0;
+		for (int line = 0; line < 25; ++line)
+		{
+			const std::size_t end = frame.find('\n', start);
+			const std::string text = frame.substr(start, end - start);
+			const auto columns = std::count_if(text.begin(), text.end(),
+				[](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; });
+			CHECK_EQ(columns, std::ptrdiff_t{78});
+			start = end + 1;
+		}
+	}
 }
 
 TEST(serviceNames)
