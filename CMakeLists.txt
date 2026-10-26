@@ -25,6 +25,9 @@ add_library(wiresight_core STATIC
 	src/dns.cpp
 	src/packet.cpp
 	src/format.cpp
+	src/scan.cpp
+	src/watch.cpp
+	src/demo.cpp
 )
 target_include_directories(wiresight_core PUBLIC src)
 
@@ -55,6 +58,7 @@ add_executable(wiresight_tests
 	tests/test_dns.cpp
 	tests/test_format.cpp
 	tests/test_edge_cases.cpp
+	tests/test_scan.cpp
 )
 target_link_libraries(wiresight_tests PRIVATE wiresight_core)
 target_link_options(wiresight_tests PRIVATE ${STATIC_RUNTIME})

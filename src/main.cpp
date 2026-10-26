@@ -1,15 +1,30 @@
 #include "capture.hpp"
+#include "demo.hpp"
 #include "format.hpp"
 #include "packet.hpp"
+#include "scan.hpp"
+#include "watch.hpp"
 
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <format>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -38,8 +53,13 @@ constexpr std::string_view USAGE = R"(usage: wiresight [options]
   -c, --count N          stop after N packets
   -v, --verbose          show every layer of each packet
   -p, --promiscuous      also capture traffic for other machines on the network
+  -w, --watch            show the scan watch: a pixel-art view of port scans instead of packet lines
+      --demo             play a built-in port scan in the scan watch (no capture, no admin rights)
+      --scan-threshold N distinct ports from one address within 10 s that count as a scan (default 20)
       --version          show the version and the capture library
   -h, --help             show this help
+
+Port scans are always detected: a "PORT SCAN" line appears among the packets.
 
 Live capture needs Npcap (Windows, https://npcap.com) or libpcap (Linux, macOS).
 Only capture on networks you own or have permission to monitor.
@@ -72,6 +92,12 @@ struct Options
 	bool promiscuous = false;
 	/** WHAT: --version was given. */
 	bool version = false;
+	/** WHAT: --watch was given (or --demo, which implies it). */
+	bool watch = false;
+	/** WHAT: --demo was given. */
+	bool demo = false;
+	/** WHAT: the value of --scan-threshold. */
+	std::size_t scanThreshold = 20;
 	/** WHAT: --help was given, or no arguments at all. */
 	bool help = false;
 	/** WHAT: the value of --interface, or "". */
@@ -149,6 +175,18 @@ Options parseArguments(int argc, char** argv)
 		else if (argument == "-v" || argument == "--verbose") options.verbose = true;
 		else if (argument == "-p" || argument == "--promiscuous") options.promiscuous = true;
 		else if (argument == "--version") options.version = true;
+		else if (argument == "-w" || argument == "--watch") options.watch = true;
+		else if (argument == "--demo") options.demo = options.watch = true;
+		else if (argument == "--scan-threshold")
+		{
+			const std::string text = value();
+			const auto threshold = parsePositive(text);
+			if (!threshold || *threshold < 2)
+			{
+				throw UsageError("--scan-threshold needs a whole number of 2 or more, got '" + text + "'");
+			}
+			options.scanThreshold = *threshold;
+		}
 		else if (argument == "-h" || argument == "--help") options.help = true;
 		else if (argument == "-c" || argument == "--count")
 		{
@@ -166,10 +204,11 @@ Options parseArguments(int argc, char** argv)
 		}
 	}
 
-	const int sources = (options.list ? 1 : 0) + (options.interface.empty() ? 0 : 1) + (options.file.empty() ? 0 : 1);
+	const int sources = (options.list ? 1 : 0) + (options.interface.empty() ? 0 : 1) + (options.file.empty() ? 0 : 1)
+		+ (options.demo ? 1 : 0);
 	if (!options.help && !options.version && sources != 1)
 	{
-		throw UsageError("choose exactly one of --list, --interface or --read");
+		throw UsageError("choose exactly one of --list, --interface, --read or --demo");
 	}
 	return options;
 }
@@ -231,8 +270,168 @@ std::string resolveInterface(const std::string& choice)
 }
 
 /**
- * WHAT:   Reads packets and prints them until the count, the end of the
- *         file, or Ctrl+C.
+ * WHAT:   Turns on UTF-8 output and ANSI escape codes in the Windows console.
+ * WHY:    The scan watch draws with half-block characters and 24-bit
+ *         colour; Windows Terminal and the classic console both support
+ *         them, but only once a program asks. Elsewhere this does nothing.
+ */
+void prepareTerminal()
+{
+#ifdef _WIN32
+	SetConsoleOutputCP(CP_UTF8);
+	const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+	DWORD mode = 0;
+	if (out != INVALID_HANDLE_VALUE && GetConsoleMode(out, &mode))
+	{
+		SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+	}
+#endif
+}
+
+/**
+ * WHAT:   Feeds packets to the scan detector and shows the result, either
+ *         as alert lines among the packet lines or as the scan watch.
+ * WHY:    Live capture, files and the demo all produce packets the same
+ *         way, so they share one place that detects and draws.
+ */
+class Watcher
+{
+public:
+	/**
+	 * WHAT:   Starts watching.
+	 * POST:   in watch mode the screen is cleared and the cursor hidden
+	 *
+	 * @param options     the parsed options
+	 * @param sourceLabel "LIVE", "FILE" or "DEMO", shown in the title
+	 */
+	Watcher(const Options& options, std::string sourceLabel)
+		: options_(options), detector_(options.scanThreshold)
+	{
+		status_.sourceLabel = std::move(sourceLabel);
+		if (options_.watch)
+		{
+			prepareTerminal();
+			std::cout << "\x1b[2J\x1b[?25l" << renderWatch(nullptr, status_, 0) << std::flush;
+		}
+	}
+
+	Watcher(const Watcher&) = delete;
+	Watcher& operator=(const Watcher&) = delete;
+
+	/**
+	 * WHAT:   Shows the cursor again.
+	 * WHY:    An error or Ctrl+C must not leave the terminal without a cursor.
+	 */
+	~Watcher()
+	{
+		if (options_.watch)
+		{
+			std::cout << "\x1b[?25h" << std::flush;
+		}
+	}
+
+	/**
+	 * WHAT:   Handles one decoded packet.
+	 * POST:   the detector has seen it; in line mode the packet (and any
+	 *         alert) is printed; in watch mode a frame may be drawn
+	 *
+	 * @param packet     the decoded packet
+	 * @param timeMicros its capture time, microseconds since 1970
+	 * @param timestamp  its time as text, for line mode
+	 */
+	void onPacket(const DecodedPacket& packet, std::int64_t timeMicros, const std::string& timestamp)
+	{
+		++status_.packets;
+		status_.nowMicros = timeMicros;
+		const std::optional<ScanAlert> alert = detector_.observe(packet, timeMicros);
+		if (alert)
+		{
+			status_.alert = alert;
+		}
+
+		if (options_.watch)
+		{
+			draw(false);
+			return;
+		}
+		std::cout << timestamp << "  " << summarize(packet) << '\n';
+		if (options_.verbose)
+		{
+			std::cout << describeLayers(packet);
+		}
+		if (alert)
+		{
+			std::cout << std::format("!!  PORT SCAN  {} -> {}: {} ports in {:.2f} s\n", alert->source, alert->target,
+				alert->ports, static_cast<double>(alert->elapsedMicros) / 1e6);
+		}
+		std::cout.flush();
+	}
+
+	/**
+	 * WHAT:   Draws a frame if enough time has passed since the last one.
+	 * WHY:    Drawing every packet would flood the terminal during a fast
+	 *         scan; about 12 frames a second is smooth and cheap. Also
+	 *         called while waiting, so the animation keeps moving.
+	 *
+	 * @param force draw now, whatever the time
+	 */
+	void draw(bool force)
+	{
+		if (!options_.watch)
+		{
+			return;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (!force && now - lastDraw_ < std::chrono::milliseconds(80))
+		{
+			return;
+		}
+		lastDraw_ = now;
+		std::cout << renderWatch(detector_.busiest(), status_, tick_++) << std::flush;
+	}
+
+	/**
+	 * WHAT:   Ends the run: the last frame in watch mode, then a summary on stderr.
+	 * POST:   the cursor is visible again
+	 */
+	void finish()
+	{
+		if (options_.watch)
+		{
+			status_.finished = true;
+			draw(true);
+			std::cout << "\x1b[?25h" << std::flush;
+		}
+		std::cerr << status_.packets << (status_.packets == 1 ? " packet" : " packets")
+				  << (status_.alert ? ", port scan detected\n" : ", no port scan detected\n");
+	}
+
+	/**
+	 * WHAT:   How many packets have been handled.
+	 * RETURN: the count
+	 *
+	 * @return the packet count
+	 */
+	std::size_t packets() const
+	{
+		return status_.packets;
+	}
+
+private:
+	/** WHAT: the command line, for watch and verbose. */
+	const Options& options_;
+	/** WHAT: finds the scans. */
+	ScanDetector detector_;
+	/** WHAT: counts, time and the latest alert, for the view. */
+	WatchStatus status_;
+	/** WHAT: animation step. */
+	int tick_ = 0;
+	/** WHAT: when the last frame was drawn. */
+	std::chrono::steady_clock::time_point lastDraw_{};
+};
+
+/**
+ * WHAT:   Reads packets until the count, the end of the file, or Ctrl+C.
  * WHY:    Status goes to stderr and packets to stdout, so the output can be
  *         piped to grep or a file without the status lines.
  * THROWS: CaptureError if reading fails
@@ -251,13 +450,14 @@ void runCapture(Capture& capture, const Options& options)
 	}
 
 	std::signal(SIGINT, onInterrupt);
+	Watcher watcher(options, options.file.empty() ? "LIVE" : "FILE");
 	RawPacket raw;
-	std::size_t shown = 0;
-	while (!stopRequested && (options.count == 0 || shown < options.count))
+	while (!stopRequested && (options.count == 0 || watcher.packets() < options.count))
 	{
 		const ReadResult result = capture.next(raw);
 		if (result == ReadResult::Timeout)
 		{
+			watcher.draw(false);
 			continue;
 		}
 		if (result == ReadResult::End)
@@ -266,15 +466,52 @@ void runCapture(Capture& capture, const Options& options)
 		}
 
 		const DecodedPacket packet = decode(raw.data, link, raw.originalLength);
-		std::cout << formatTimestamp(raw.seconds, raw.microseconds) << "  " << summarize(packet) << '\n';
-		if (options.verbose)
-		{
-			std::cout << describeLayers(packet);
-		}
-		std::cout.flush();
-		++shown;
+		watcher.onPacket(packet, raw.seconds * 1'000'000 + raw.microseconds, formatTimestamp(raw.seconds, raw.microseconds));
 	}
-	std::cerr << shown << (shown == 1 ? " packet\n" : " packets\n");
+	watcher.finish();
+}
+
+/**
+ * WHAT:   Plays the built-in port scan in real time through the decoder,
+ *         the detector and the scan watch.
+ * WHY:    Anyone can see what wiresight detects in about ten seconds,
+ *         without Npcap, admin rights, or scanning a real machine.
+ *
+ * @param options the parsed options
+ */
+void runDemo(const Options& options)
+{
+	std::signal(SIGINT, onInterrupt);
+	const std::vector<DemoPacket> packets = scanDemo();
+	const auto start = std::chrono::steady_clock::now();
+	const std::int64_t base = std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+
+	Watcher watcher(options, "DEMO");
+	for (const DemoPacket& demo : packets)
+	{
+		const auto due = start + std::chrono::microseconds(demo.offsetMicros);
+		while (!stopRequested && std::chrono::steady_clock::now() < due)
+		{
+			watcher.draw(false);
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		if (stopRequested)
+		{
+			break;
+		}
+		const DecodedPacket packet = decode(Bytes(demo.frame), LinkType::Ethernet, demo.frame.size());
+		watcher.onPacket(packet, base + demo.offsetMicros, "");
+	}
+
+	// let the alarm blink for a moment before the final frame
+	const auto hold = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+	while (!stopRequested && std::chrono::steady_clock::now() < hold)
+	{
+		watcher.draw(false);
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+	watcher.finish();
 }
 
 } // namespace
@@ -311,6 +548,12 @@ int main(int argc, char** argv)
 			return 0;
 		}
 
+		if (options.demo)
+		{
+			runDemo(options);
+			return 0;
+		}
+
 		Capture capture = options.file.empty()
 			? Capture::openLive(resolveInterface(options.interface), SNAP_LENGTH, options.promiscuous, READ_TIMEOUT_MS)
 			: Capture::openFile(options.file);
@@ -318,7 +561,7 @@ int main(int argc, char** argv)
 		{
 			capture.setFilter(options.filter);
 		}
-		if (options.file.empty())
+		if (options.file.empty() && !options.watch)
 		{
 			std::cerr << "capturing, press Ctrl+C to stop\n";
 		}

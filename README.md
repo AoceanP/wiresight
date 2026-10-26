@@ -15,6 +15,10 @@ A command-line tool that opens a network interface (or a saved `.pcap` file), re
 17:26:48.401688  TCP   127.0.0.1:9 -> 127.0.0.1:62530  [RST, ACK] seq=0 ack=1602619757 len=0
 ```
 
+It also **spots port scans** as they happen. With `--watch` it draws them as pixel art in the terminal: the scanner, the target, packets moving along the wire, and a map of ports 1 to 1024 filling up as they are probed.
+
+![The scan watch in the middle of a scan: closed ports in dark red, open ports in green, and the PORT SCAN alarm](docs/scan-watch.png)
+
 ### Problem
 
 Everything on a network, a web page, a DNS lookup, a port scan, an attack, is just bytes on a wire. When something breaks or looks suspicious, the only ground truth is **what the packets actually say**:
@@ -29,6 +33,7 @@ Wireshark answers this, but it hides the hard part: turning raw bytes into field
 - **Live capture through Npcap/libpcap**, with optional BPF filters (`tcp port 445`) so the kernel driver drops unwanted packets before they are copied.
 - **Hand-written decoders for each layer**, reading big-endian fields from a `std::span` of bytes, with every length field checked before it is trusted.
 - **Defensive DNS parsing:** compressed names are followed with a cap of 16 pointer jumps and 255 bytes, so a crafted packet that points at itself cannot hang the program.
+- **Port scan detection:** one address sending SYNs to 20 or more different ports of one target within 10 seconds raises an alarm. Counting *different ports*, not connections, keeps a browser opening dozens of connections to port 443 quiet.
 - **Safe-by-design capture:** only the first 512 bytes of each frame are kept, nothing is written to disk, and on Windows the capture library is loaded by its full path to avoid DLL hijacking.
 
 ### Why I built it
@@ -45,7 +50,9 @@ Wireshark already exists. wiresight exists to understand **how packet analysis w
 | Byte order, `std::span`, `std::optional` | `bytes.hpp` and every decoder |
 | RAII, move-only resource handles | `Capture` in `capture.cpp` |
 | Loading a DLL safely at run time | `pcapApi()` in `capture.cpp` |
-| Testing hostile input | 49 tests, including every possible truncation of real packets |
+| Detecting a port scan in a sliding window | `scan.cpp` |
+| Pixel art in a terminal: half blocks and 24-bit colour | `watch.cpp` |
+| Testing hostile input | 63 tests, including every possible truncation of real packets |
 
 ### Part of a project series
 
@@ -99,7 +106,7 @@ On Linux, leave out `-DNPCAP_SDK_DIR`. You can also set an `NPCAP_SDK` environme
 build/wiresight_tests
 ```
 
-It ends with `49 of 49 tests passed`.
+It ends with `63 of 63 tests passed`.
 
 ### 5. Capture
 
@@ -133,9 +140,47 @@ wiresight [options]
 | `-c, --count N` | stop after `N` packets |
 | `-v, --verbose` | show every layer of each packet |
 | `-p, --promiscuous` | also capture traffic for other machines on the network |
+| `-w, --watch` | show the scan watch (pixel art) instead of packet lines |
+| `--demo` | play a built-in port scan in the scan watch: no capture, no admin rights |
+| `--scan-threshold N` | different ports from one address within 10 s that count as a scan (default 20) |
 | `--version` | show the version and the capture library |
 
 Packets go to standard output and status lines to standard error, so the output can be piped to `grep` or a file. Press Ctrl+C to stop.
+
+### Scan watch: see a port scan
+
+Try it with no setup at all:
+
+```
+wiresight --demo
+```
+
+This plays a made-up scan through the real decoder and detector. First comes a second of normal browsing, which raises no alarm. Then 203.0.113.7 scans ports 1 to 1024 of 198.51.100.20 the way portscout does. (Both addresses are reserved for documentation, so nothing real is involved.)
+
+How to read the screen:
+
+| Part | What it shows |
+|---|---|
+| **The wire** | amber dots are SYN probes going to the target; dots coming back are its answers, green for "open" (SYN-ACK) and red for "closed" (RST) |
+| **The server's LEDs** | top: power, and amber blinking while it is being probed. Bottom: green once an open port is found, and red blinking when the alarm is raised |
+| **The port map** | one pixel per port, 1 to 1024, left to right and top to bottom like reading a page. Dark: not probed. Amber: probed, no answer (a firewall dropping it shows up as amber that never changes). Dark red: closed. Green: open. White: the newest probe |
+| **The counts** | probed, open, closed and unanswered ports, with the open ones named (22 ssh, 443 https) |
+| **The banner** | green "no scan detected" until one address probes 20 different ports within 10 s, then the red **PORT SCAN** alarm |
+
+To watch a real scan, capture the loopback adapter and scan yourself with portscout:
+
+```
+wiresight -i 10 --watch
+portscout 127.0.0.1 -p 1-1024
+```
+
+Without `--watch`, scans are still detected: a line appears among the packets.
+
+```
+!!  PORT SCAN  127.0.0.1 -> 127.0.0.1: 20 ports in 0.71 s
+```
+
+The view needs a terminal with 24-bit colour, 80 columns wide: Windows Terminal, the Windows 10/11 console, and every common macOS and Linux terminal.
 
 ### Example: watching portscout
 
@@ -205,7 +250,7 @@ Both diagrams are drawn in draw.io: [wiresight-flow.drawio](docs/wiresight-flow.
 
 ## Tests
 
-49 tests in `tests/`, built from real packets written byte by byte, using a small test framework with no downloads. They need no network card, Npcap or admin rights.
+63 tests in `tests/`, built from real packets written byte by byte, using a small test framework with no downloads. They need no network card, Npcap or admin rights.
 
 | File | What it covers |
 |---|---|
@@ -215,6 +260,7 @@ Both diagrams are drawn in draw.io: [wiresight-flow.drawio](docs/wiresight-flow.
 | `test_dns.cpp` | queries, compressed answers, CNAME chains, AAAA, NXDOMAIN |
 | `test_format.cpp` | summary lines, IPv6 brackets, notes, verbose output, timestamps |
 | `test_edge_cases.cpp` | truncated, malformed and hostile input (see below) |
+| `test_scan.cpp` | the scan detector (threshold, window, one alert per pair, a browser is not a scan, a full 65,535-port scan in under 2 s), the demo, and the watch screen |
 
 The build uses `-Wall -Wextra -Wpedantic -Wshadow` and compiles with no warnings.
 
@@ -223,7 +269,8 @@ The build uses `-Wall -Wextra -Wpedantic -Wshadow` and compiles with no warnings
 - [x] Ethernet, VLAN, ARP, IPv4, IPv6, TCP, UDP, ICMP, DNS decoders
 - [x] Live capture, BPF filters, .pcap files
 - [ ] TCP stream tracking (follow one connection)
-- [ ] Detect suspicious patterns: port scans, ARP spoofing, DNS tunnelling
+- [x] Detect port scans (one address, many ports), with the pixel-art scan watch
+- [ ] Detect more patterns: sweeps (one port, many hosts), ARP spoofing, DNS tunnelling
 - [ ] TLS ClientHello: show the server name (SNI)
 
 ## License
