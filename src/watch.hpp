@@ -18,20 +18,27 @@ struct WatchStatus
 	std::size_t packets = 0;
 	/** WHAT: time of the latest packet, microseconds since 1970. */
 	std::int64_t nowMicros = 0;
-	/** WHAT: the latest alert, if any was raised. */
+	/** WHAT: the latest port-scan alert, if any was raised. */
 	std::optional<ScanAlert> alert;
+	/** WHAT: the latest host-sweep alert, if any was raised. */
+	std::optional<ScanAlert> sweep;
+	/** WHAT: source/target pairs the detector follows right now. */
+	std::size_t tracked = 0;
+	/** WHAT: pairs and sweeps dropped because a table was full. */
+	std::size_t dropped = 0;
 	/** WHAT: the input has ended (file or demo finished). */
 	bool finished = false;
 };
 
 /** WHAT: lines in every frame, so the screen can be redrawn in place. */
-inline constexpr int WATCH_LINES = 27;
+inline constexpr int WATCH_LINES = 28;
 
 /**
  * WHAT:   Draws one frame of the scan watch: a pixel-art scanner and
  *         server joined by a wire with packets moving along it, a map of
  *         ports 1 to 1024 (one pixel per port, coloured by what the scan
- *         found), the counts, the open ports, and the alert banner.
+ *         found), the counts, the open ports, and two alert banners:
+ *         one for port scans, one for host sweeps.
  * WHY:    A port scan is hard to picture from a list of packet lines; as a
  *         grid filling up it is obvious at a glance: the sweep, the few
  *         green open ports, and the red alarm. Pixels are drawn with the

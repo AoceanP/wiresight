@@ -15,9 +15,9 @@ A command-line tool that opens a network interface (or a saved `.pcap` file), re
 17:26:48.401688  TCP   127.0.0.1:9 -> 127.0.0.1:62530  [RST, ACK] seq=0 ack=1602619757 len=0
 ```
 
-It also **spots port scans** as they happen. With `--watch` it draws them as pixel art in the terminal: the scanner, the target, packets moving along the wire, and a map of ports 1 to 1024 filling up as they are probed.
+It also **spots port scans and host sweeps** as they happen. With `--watch` it draws them as pixel art in the terminal: the scanner, the target, packets moving along the wire, and a map of ports 1 to 1024 filling up as they are probed.
 
-![The scan watch in the middle of a scan: closed ports in dark red, open ports in green, and the PORT SCAN alarm](docs/scan-watch.png)
+![The scan watch after the demo: closed ports in dark red, open ports in green, and the PORT SCAN and HOST SWEEP alarms](docs/scan-watch.png)
 
 ### Problem
 
@@ -34,6 +34,8 @@ Wireshark answers this, but it hides the hard part: turning raw bytes into field
 - **Hand-written decoders for each layer**, reading big-endian fields from a `std::span` of bytes, with every length field checked before it is trusted.
 - **Defensive DNS parsing:** compressed names are followed with a cap of 16 pointer jumps and 255 bytes, so a crafted packet that points at itself cannot hang the program.
 - **Port scan detection:** one address sending SYNs to 20 or more different ports of one target within 10 seconds raises an alarm. Counting *different ports*, not connections, keeps a browser opening dozens of connections to port 443 quiet.
+- **Host sweep detection:** one address sending SYNs to the same port on 20 or more hosts of one subnet (a /24, or a /64 for IPv6) within 10 seconds raises a second alarm. That is the other half of reconnaissance: "which machines here run SSH?" rather than "what runs on this machine?". Counting per subnet keeps a browser quiet, since the dozens of servers it reaches on 443 are spread across the internet.
+- **A detector that defends itself:** every SYN from a new address creates a record, so a flood of SYNs from forged addresses could grow memory without limit and crash the watcher. At most 4,096 conversations are tracked. When the table is full, the least recently active one is dropped (never the scan on screen), and the drops are counted and shown in red, so the flood itself becomes visible. Answers (SYN-ACK, RST) never create records, so forged answers cost nothing.
 - **Safe-by-design capture:** only the first 512 bytes of each frame are kept, nothing is written to disk, and on Windows the capture library is loaded by its full path to avoid DLL hijacking.
 
 ### Why I built it
@@ -50,9 +52,10 @@ Wireshark already exists. wiresight exists to understand **how packet analysis w
 | Byte order, `std::span`, `std::optional` | `bytes.hpp` and every decoder |
 | RAII, move-only resource handles | `Capture` in `capture.cpp` |
 | Loading a DLL safely at run time | `pcapApi()` in `capture.cpp` |
-| Detecting a port scan in a sliding window | `scan.cpp` |
+| Detecting port scans and host sweeps in a sliding window | `scan.cpp` |
+| Bounding memory under a flood: a least-recently-used table with O(1) updates | `scan.hpp`, `scan.cpp` |
 | Pixel art in a terminal: half blocks and 24-bit colour | `watch.cpp` |
-| Testing hostile input | 64 tests, including every possible truncation of real packets |
+| Testing hostile input | 77 tests, including every possible truncation of real packets |
 
 ### Part of a project series
 
@@ -106,7 +109,7 @@ On Linux, leave out `-DNPCAP_SDK_DIR`. You can also set an `NPCAP_SDK` environme
 build/wiresight_tests
 ```
 
-It ends with `64 of 64 tests passed`.
+It ends with `77 of 77 tests passed`.
 
 ### 5. Capture
 
@@ -143,11 +146,12 @@ wiresight [options]
 | `-w, --watch` | show the scan watch (pixel art) instead of packet lines |
 | `--demo` | play a built-in port scan in the scan watch: no capture, no admin rights |
 | `--scan-threshold N` | different ports from one address within 10 s that count as a scan (default 20) |
+| `--sweep-threshold N` | hosts of one subnet probed on the same port within 10 s that count as a sweep (default 20) |
 | `--version` | show the version and the capture library |
 
 Packets go to standard output and status lines to standard error, so the output can be piped to `grep` or a file. Press Ctrl+C to stop.
 
-### Scan watch: see a port scan
+### Scan watch: see a port scan and a sweep
 
 Try it with no setup at all:
 
@@ -155,7 +159,7 @@ Try it with no setup at all:
 wiresight --demo
 ```
 
-This plays a made-up scan through the real decoder and detector. First comes a second of normal browsing, which raises no alarm. Then 203.0.113.7 scans ports 1 to 1024 of 198.51.100.20 the way portscout does. (Both addresses are reserved for documentation, so nothing real is involved.)
+This plays a made-up scan through the real decoder and detector. First comes a second of normal browsing, which raises no alarm. Then 203.0.113.7 scans ports 1 to 1024 of 198.51.100.20 the way portscout does. Finally it sweeps port 22 across hosts .1 to .40 of the same subnet, and three of them answer. (All the addresses are reserved for documentation, so nothing real is involved.)
 
 How to read the screen:
 
@@ -165,7 +169,8 @@ How to read the screen:
 | **The server's LEDs** | top: power, and amber blinking while it is being probed. Bottom: green once an open port is found, and red blinking when the alarm is raised |
 | **The port map** | one pixel per port, 1 to 1024, left to right and top to bottom like reading a page. Dark: not probed. Amber: probed, no answer (a firewall dropping it shows up as amber that never changes). Dark red: closed. Green: open. White: the newest probe |
 | **The counts** | probed, open, closed and unanswered ports, with the open ones named (22 ssh, 443 https) |
-| **The banner** | green "no scan detected" until one address probes 20 different ports within 10 s, then the red **PORT SCAN** alarm |
+| **The banners** | top: green "no scan detected" until one address probes 20 different ports within 10 s, then the red **PORT SCAN** alarm. Bottom: green "no sweep detected" until one address probes the same port on 20 hosts of one subnet, then the red **HOST SWEEP** alarm |
+| **The last line** | how many conversations the detector is following. If its table ever fills, this turns red and counts the drops: the sign of a SYN flood from forged addresses |
 
 To watch a real scan, capture the loopback adapter and scan yourself with portscout:
 
@@ -178,7 +183,10 @@ Without `--watch`, scans are still detected: a line appears among the packets.
 
 ```
 !!  PORT SCAN  127.0.0.1 -> 127.0.0.1: 20 ports in 0.71 s
+!!  HOST SWEEP  203.0.113.7 -> 198.51.100.0/24 port 22: 20 hosts in 0.76 s
 ```
+
+If the table filled during the run, a warning at the end says how many conversations were dropped.
 
 The view needs a terminal with 24-bit colour, 80 columns wide: Windows Terminal, the Windows 10/11 console, and every common macOS and Linux terminal.
 
@@ -232,7 +240,8 @@ If you redirect the output to a file, or save `.pcap` files with other tools, tr
 3. **Network layer:** the IP version nibble picks IPv4 or IPv6. IPv4 checks its header checksum and fragment offset; IPv6 walks up to 8 extension headers.
 4. **Transport layer:** the protocol number picks TCP, UDP or ICMP. Later fragments are not decoded, because only the first fragment holds the transport header.
 5. **Application layer:** UDP on port 53 or 5353 (multicast DNS) is decoded as DNS.
-6. **Output:** the highest decoded layer gives the summary line; `-v` prints every layer; anything unusual is added as a note after `!`.
+6. **Detection:** every SYN updates two sliding windows, one counting different ports per (source, target) pair and one counting different hosts per (source, subnet, port). Each is a queue plus per-key counts, so a packet costs the same however big the scan gets. Both tables have a cap. A linked list keeps the least recently active entry at the front, so updating and dropping are O(1).
+7. **Output:** the highest decoded layer gives the summary line; `-v` prints every layer; anything unusual is added as a note after `!`.
 
 Every decoder takes a `std::span` of bytes and returns a `std::optional`: either a fully checked header, or nothing. Bad input becomes a note, never a crash or an out-of-bounds read.
 
@@ -250,7 +259,7 @@ Both diagrams are drawn in draw.io: [wiresight-flow.drawio](docs/wiresight-flow.
 
 ## Tests
 
-64 tests in `tests/`, built from real packets written byte by byte, using a small test framework with no downloads. They need no network card, Npcap or admin rights.
+77 tests in `tests/`, built from real packets written byte by byte, using a small test framework with no downloads. They need no network card, Npcap or admin rights.
 
 | File | What it covers |
 |---|---|
@@ -260,6 +269,7 @@ Both diagrams are drawn in draw.io: [wiresight-flow.drawio](docs/wiresight-flow.
 | `test_dns.cpp` | queries, compressed answers, CNAME chains, AAAA, NXDOMAIN |
 | `test_format.cpp` | summary lines, IPv6 brackets, notes, verbose output, timestamps |
 | `test_edge_cases.cpp` | truncated, malformed and hostile input (see below) |
+| `test_recon.cpp` | host sweeps (threshold, window, one alert, servers across the internet are not a sweep, IPv6 /64), a port scan and a sweep as separate alerts, and floods: 10,000 forged addresses stay within the cap, a flood never drops the scan on screen or hides a real scan, forged answers create nothing; the watch screen with both banners within 78 columns |
 | `test_scan.cpp` | the scan detector (threshold, window, one alert per pair, a browser is not a scan, a full 65,535-port scan in under 2 s), the demo, and the watch screen |
 
 The build uses `-Wall -Wextra -Wpedantic -Wshadow` and compiles with no warnings.
@@ -270,7 +280,8 @@ The build uses `-Wall -Wextra -Wpedantic -Wshadow` and compiles with no warnings
 - [x] Live capture, BPF filters, .pcap files
 - [ ] TCP stream tracking (follow one connection)
 - [x] Detect port scans (one address, many ports), with the pixel-art scan watch
-- [ ] Detect more patterns: sweeps (one port, many hosts), ARP spoofing, DNS tunnelling
+- [x] Detect host sweeps (one port, many hosts), and cap the detector's memory under a SYN flood
+- [ ] Detect more patterns: ARP spoofing, DNS tunnelling
 - [ ] TLS ClientHello: show the server name (SNI)
 
 ## License

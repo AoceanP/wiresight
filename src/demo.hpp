@@ -28,7 +28,9 @@ inline constexpr const char* DEMO_TARGET = "198.51.100.20";
  *         browsing (which must not raise an alert), then 203.0.113.7 scans
  *         ports 1 to 1024 of 198.51.100.20 the way portscout does (a full
  *         TCP connect: SYN, then SYN-ACK or RST). Ports 22, 80, 443 and 445
- *         are open; 135 to 139 are filtered and never answer.
+ *         are open; 135 to 139 are filtered and never answer. Then the
+ *         same scanner sweeps port 22 across hosts .1 to .40 of the
+ *         subnet; three answer.
  * RETURN: the frames in time order
  *
  * @return the demo frames

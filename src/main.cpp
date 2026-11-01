@@ -56,10 +56,11 @@ constexpr std::string_view USAGE = R"(usage: wiresight [options]
   -w, --watch            show the scan watch: a pixel-art view of port scans instead of packet lines
       --demo             play a built-in port scan in the scan watch (no capture, no admin rights)
       --scan-threshold N distinct ports from one address within 10 s that count as a scan (default 20)
+      --sweep-threshold N hosts of one subnet probed on one port within 10 s that count as a sweep (default 20)
       --version          show the version and the capture library
   -h, --help             show this help
 
-Port scans are always detected: a "PORT SCAN" line appears among the packets.
+Scans are always detected: a "PORT SCAN" or "HOST SWEEP" line appears among the packets.
 
 Live capture needs Npcap (Windows, https://npcap.com) or libpcap (Linux, macOS).
 Only capture on networks you own or have permission to monitor.
@@ -98,6 +99,8 @@ struct Options
 	bool demo = false;
 	/** WHAT: the value of --scan-threshold. */
 	std::size_t scanThreshold = 20;
+	/** WHAT: the value of --sweep-threshold. */
+	std::size_t sweepThreshold = 20;
 	/** WHAT: --help was given, or no arguments at all. */
 	bool help = false;
 	/** WHAT: the value of --interface, or "". */
@@ -186,6 +189,16 @@ Options parseArguments(int argc, char** argv)
 				throw UsageError("--scan-threshold needs a whole number of 2 or more, got '" + text + "'");
 			}
 			options.scanThreshold = *threshold;
+		}
+		else if (argument == "--sweep-threshold")
+		{
+			const std::string text = value();
+			const auto threshold = parsePositive(text);
+			if (!threshold || *threshold < 2)
+			{
+				throw UsageError("--sweep-threshold needs a whole number of 2 or more, got '" + text + "'");
+			}
+			options.sweepThreshold = *threshold;
 		}
 		else if (argument == "-h" || argument == "--help") options.help = true;
 		else if (argument == "-c" || argument == "--count")
@@ -305,7 +318,7 @@ public:
 	 * @param sourceLabel "LIVE", "FILE" or "DEMO", shown in the title
 	 */
 	Watcher(const Options& options, std::string sourceLabel)
-		: options_(options), detector_(options.scanThreshold)
+		: options_(options), detector_(options.scanThreshold, 10'000'000, options.sweepThreshold)
 	{
 		status_.sourceLabel = std::move(sourceLabel);
 		if (options_.watch)
@@ -346,8 +359,10 @@ public:
 		const std::optional<ScanAlert> alert = detector_.observe(packet, timeMicros);
 		if (alert)
 		{
-			status_.alert = alert;
+			(alert->kind == ScanKind::PortScan ? status_.alert : status_.sweep) = alert;
 		}
+		status_.tracked = detector_.tracked();
+		status_.dropped = detector_.dropped();
 
 		if (options_.watch)
 		{
@@ -359,10 +374,15 @@ public:
 		{
 			std::cout << describeLayers(packet);
 		}
-		if (alert)
+		if (alert && alert->kind == ScanKind::PortScan)
 		{
 			std::cout << std::format("!!  PORT SCAN  {} -> {}: {} ports in {:.2f} s\n", alert->source, alert->target,
 				alert->ports, static_cast<double>(alert->elapsedMicros) / 1e6);
+		}
+		else if (alert)
+		{
+			std::cout << std::format("!!  HOST SWEEP  {} -> {} port {}: {} hosts in {:.2f} s\n", alert->source,
+				alert->target, alert->port, alert->hosts, static_cast<double>(alert->elapsedMicros) / 1e6);
 		}
 		std::cout.flush();
 	}
@@ -403,7 +423,14 @@ public:
 			std::cout << "\x1b[?25h" << std::flush;
 		}
 		std::cerr << status_.packets << (status_.packets == 1 ? " packet" : " packets")
-				  << (status_.alert ? ", port scan detected\n" : ", no port scan detected\n");
+				  << (status_.alert ? ", port scan detected" : ", no port scan detected")
+				  << (status_.sweep ? ", host sweep detected\n" : ", no host sweep detected\n");
+		if (status_.dropped > 0)
+		{
+			// the tables filled up: normal traffic never does that, a flood of forged addresses does
+			std::cerr << "warning: " << status_.dropped
+					  << " tracked conversations were dropped because the table was full (a SYN flood?)\n";
+		}
 	}
 
 	/**

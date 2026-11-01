@@ -59,6 +59,7 @@ add_executable(wiresight_tests
 	tests/test_format.cpp
 	tests/test_edge_cases.cpp
 	tests/test_scan.cpp
+	tests/test_recon.cpp
 )
 target_link_libraries(wiresight_tests PRIVATE wiresight_core)
 target_link_options(wiresight_tests PRIVATE ${STATIC_RUNTIME})

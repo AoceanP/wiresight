@@ -201,21 +201,28 @@ TEST(scanHandlesAFullPortRangeQuickly)
 	CHECK_EQ(detector.busiest()->ports.size(), std::size_t{65535});
 }
 
-TEST(demoRaisesOneAlertAndFindsTheOpenPorts)
+TEST(demoRaisesAScanAndASweepAndFindsTheOpenPorts)
 {
 	const std::vector<DemoPacket> packets = scanDemo();
 	CHECK(std::is_sorted(packets.begin(), packets.end(),
 		[](const DemoPacket& a, const DemoPacket& b) { return a.offsetMicros < b.offsetMicros; }));
 
 	ScanDetector detector;
-	int alerts = 0;
+	std::vector<ScanAlert> alerts;
 	for (const DemoPacket& demo : packets)
 	{
 		const DecodedPacket packet = decode(Bytes(demo.frame), LinkType::Ethernet, demo.frame.size());
 		CHECK(packet.notes.empty());
-		alerts += detector.observe(packet, demo.offsetMicros) ? 1 : 0;
+		if (auto alert = detector.observe(packet, demo.offsetMicros))
+		{
+			alerts.push_back(*alert);
+		}
 	}
-	CHECK_EQ(alerts, 1);
+	CHECK_EQ(alerts.size(), std::size_t{2});
+	CHECK(alerts[0].kind == ScanKind::PortScan);
+	CHECK(alerts[1].kind == ScanKind::HostSweep);
+	CHECK_EQ(alerts[1].target, std::string("198.51.100.0/24"));
+	CHECK_EQ(alerts[1].port, std::uint16_t{22});
 	const ScanTrack* track = detector.busiest();
 	CHECK_EQ(track->source, std::string(DEMO_SCANNER));
 	CHECK_EQ(track->target, std::string(DEMO_TARGET));
@@ -238,7 +245,11 @@ TEST(watchFrameHasFixedHeightAndShowsTheScan)
 	}
 	detector.observe(tcp(TARGET, SCANNER, 22, 40000, tcp_flag::SYN | tcp_flag::ACK), 100);
 
-	WatchStatus status{.sourceLabel = "DEMO", .packets = 12345, .nowMicros = 100, .alert = alert, .finished = false};
+	WatchStatus status;
+	status.sourceLabel = "DEMO";
+	status.packets = 12345;
+	status.nowMicros = 100;
+	status.alert = alert;
 	const std::string frame = visible(renderWatch(detector.busiest(), status, 3));
 	CHECK_EQ(static_cast<int>(std::count(frame.begin(), frame.end(), '\n')), WATCH_LINES);
 	CHECK(frame.find("12,345 packets") != std::string::npos);

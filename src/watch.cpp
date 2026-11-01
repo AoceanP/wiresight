@@ -279,7 +279,7 @@ Rgb portColour(const ScanTrack* track, std::uint16_t port)
 	{
 		return PANEL;
 	}
-	if (!track->recent.empty() && track->recent.back().second == port)
+	if (track->probes > 0 && track->lastPort == port)
 	{
 		return WHITE;
 	}
@@ -585,23 +585,41 @@ std::string renderWatch(const ScanTrack* track, const WatchStatus& status, int t
 	}
 	out += fg(BORDER) + "╰" + rule(INNER) + "╯" + std::string(END_LINE);
 
-	// 26-27: the verdict, as a full-width bar
-	std::string verdict;
-	Rgb verdictBg = CALM_BG;
+	// 26-27: the verdicts, as full-width bars: port scans, then host sweeps
+	const auto bar = [&out](const std::string& text, Rgb colour) {
+		const int pad = std::max(0, INNER + 2 - visibleWidth(text));
+		out += bg(colour) + fg(WHITE) + text + std::string(static_cast<std::size_t>(pad), ' ') + std::string(END_LINE);
+	};
 	if (status.alert)
 	{
 		const ScanAlert& alert = *status.alert;
-		verdictBg = ALARM_BG;
-		verdict = std::format("\x1b[1m PORT SCAN DETECTED \x1b[22m  {} → {}  ·  {} different ports in {:.1f} s",
-			alert.source, alert.target, alert.ports, static_cast<double>(alert.elapsedMicros) / 1e6);
+		bar(std::format("\x1b[1m PORT SCAN DETECTED \x1b[22m {} → {} · {} ports in {:.1f} s",
+			alert.source, alert.target, alert.ports, static_cast<double>(alert.elapsedMicros) / 1e6), ALARM_BG);
 	}
 	else
 	{
-		verdict = " ✓ no scan detected  ·  watching for one address probing many ports";
+		bar(" ✓ no scan detected  ·  watching for one address probing many ports", CALM_BG);
 	}
-	const int verdictPad = std::max(0, INNER + 2 - visibleWidth(verdict));
-	out += bg(verdictBg) + fg(WHITE) + verdict + std::string(static_cast<std::size_t>(verdictPad), ' ') + std::string(END_LINE);
-	out += std::format(" {}{}{}", fg(DIM), status.finished ? "finished; this frame stays on screen" : "Ctrl+C to stop", END_LINE);
+	if (status.sweep)
+	{
+		const ScanAlert& sweep = *status.sweep;
+		const std::string name = serviceName(sweep.port);
+		bar(std::format("\x1b[1m HOST SWEEP \x1b[22m {} → {} · port {}{}{} · {} hosts in {:.1f} s",
+			sweep.source, sweep.target, sweep.port, name.empty() ? "" : " ", name, sweep.hosts,
+			static_cast<double>(sweep.elapsedMicros) / 1e6), ALARM_BG);
+	}
+	else
+	{
+		bar(" ✓ no sweep detected  ·  watching for one port probed on many hosts", CALM_BG);
+	}
+
+	// 28: what to do, and how much the detector is holding; a flood of forged addresses shows here in red
+	const std::string memory = status.dropped > 0
+		? std::format("{}{} dropped: table full, SYN flood?", fg(RED), grouped(status.dropped))
+		: std::format("tracking {} {}", grouped(status.tracked), status.tracked == 1 ? "pair" : "pairs");
+	const std::string_view action = status.finished ? (status.dropped > 0 ? "finished" : "finished; this frame stays on screen")
+													: "Ctrl+C to stop";
+	out += std::format(" {}{}  ·  {}{}{}", fg(DIM), action, memory, RESET, END_LINE);
 	return out;
 }
 

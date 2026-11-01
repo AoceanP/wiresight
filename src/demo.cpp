@@ -27,6 +27,13 @@ constexpr std::int64_t PROBE_GAP = 7'000;
 constexpr std::int64_t REPLY_DELAY = 1'500;
 /** WHAT: when the scan starts, after the normal traffic. */
 constexpr std::int64_t SCAN_START = 1'500'000;
+/** WHAT: when the host sweep starts: once the scan's own probe of port 22 has left the 10 s window,
+ *  so the sweep's alert measures the sweep alone. */
+constexpr std::int64_t SWEEP_START = SCAN_START + 1024 * PROBE_GAP + 2'500'000;
+/** WHAT: sweep speed: one host every 40 ms. */
+constexpr std::int64_t SWEEP_GAP = 40'000;
+/** WHAT: hosts .1 to .40 of the target's subnet are swept. */
+constexpr std::uint8_t SWEEP_HOSTS = 40;
 
 /**
  * WHAT:   Builds an Ethernet + IPv4 + TCP frame with no payload.
@@ -102,6 +109,22 @@ std::vector<DemoPacket> scanDemo()
 		else
 		{
 			add(at + REPLY_DELAY, tcpFrame(TARGET, SCANNER, port, scanPort, tcp_flag::RST | tcp_flag::ACK));
+		}
+	}
+
+	// then a sweep: the same scanner asks 40 hosts of the subnet "do you run SSH?".
+	// Three answer SYN-ACK (the target among them); the rest are empty addresses and stay silent.
+	constexpr std::array<std::uint8_t, 3> SSH_HOSTS = {5, 20, 31};
+	for (std::uint8_t host = 1; host <= SWEEP_HOSTS; ++host)
+	{
+		const std::int64_t at = SWEEP_START + (host - 1) * SWEEP_GAP;
+		const Ip address = {198, 51, 100, host};
+		const auto scanPort = static_cast<std::uint16_t>(50000 + host);
+		add(at, tcpFrame(SCANNER, address, scanPort, 22, tcp_flag::SYN));
+		if (std::find(SSH_HOSTS.begin(), SSH_HOSTS.end(), host) != SSH_HOSTS.end())
+		{
+			add(at + REPLY_DELAY, tcpFrame(address, SCANNER, 22, scanPort, tcp_flag::SYN | tcp_flag::ACK));
+			add(at + REPLY_DELAY + 100, tcpFrame(SCANNER, address, scanPort, 22, tcp_flag::RST | tcp_flag::ACK));
 		}
 	}
 
