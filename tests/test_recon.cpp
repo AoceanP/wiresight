@@ -126,11 +126,12 @@ TEST(sweepIgnoresBelowThreshold)
 
 TEST(sweepIgnoresSlowProbesOutsideTheWindow)
 {
-	// one host a second against a 10-second window never has 20 at once
+	// one host a second against a 10-second window never has 20 at once (the slow rule may report it)
 	ScanDetector detector(20, 10 * SECOND, 20);
 	for (int host = 1; host <= 200; ++host)
 	{
-		CHECK(!detector.observe(sshProbe(host), host * SECOND));
+		const auto alert = detector.observe(sshProbe(host), host * SECOND);
+		CHECK(!alert || alert->slow);
 	}
 }
 
@@ -288,10 +289,155 @@ TEST(watchFrameShowsSweepAndDrops)
 	CHECK(frame.find("PORT SCAN DETECTED") != std::string::npos);
 	CHECK(frame.find("HOST SWEEP") != std::string::npos);
 	CHECK(frame.find("198.51.100.0/24") != std::string::npos);
-	CHECK(frame.find("port 22 ssh") != std::string::npos);
+	CHECK(frame.find("22/ssh") != std::string::npos);
 	CHECK(frame.find("12,345 dropped") != std::string::npos);
 
 	// every line is at most 78 columns, so nothing wraps and the frame keeps its height
+	std::size_t start = 0;
+	for (int line = 0; line < WATCH_LINES; ++line)
+	{
+		const std::size_t end = frame.find('\n', start);
+		const std::string text = frame.substr(start, end - start);
+		const auto columns = std::count_if(text.begin(), text.end(),
+			[](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; });
+		CHECK(columns <= std::ptrdiff_t{78});
+		start = end + 1;
+	}
+}
+
+TEST(slowScanIsCaughtUnderTheFastAlarm)
+{
+	// one new port a second, like portscout --rate 1: never 20 in 10 s, but 100 in 99 s
+	ScanDetector detector;
+	std::vector<ScanAlert> alerts;
+	for (std::uint16_t port = 1; port <= 150; ++port)
+	{
+		if (auto alert = detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * SECOND))
+		{
+			alerts.push_back(*alert);
+		}
+	}
+	CHECK_EQ(alerts.size(), std::size_t{1});
+	CHECK(alerts[0].slow);
+	CHECK(alerts[0].kind == ScanKind::PortScan);
+	CHECK_EQ(alerts[0].ports, std::size_t{100});
+	CHECK_EQ(alerts[0].elapsedMicros, 99 * SECOND);
+	CHECK(detector.busiest()->slowAlerted);
+}
+
+TEST(slowScanNeedsAHundredPortsInFifteenMinutes)
+{
+	// 99 ports in 14.7 minutes: one short
+	ScanDetector detector;
+	for (std::uint16_t port = 1; port <= 99; ++port)
+	{
+		CHECK(!detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * 9 * SECOND));
+	}
+	// one port every 10 s for an hour: never more than 91 inside any 15 minutes
+	ScanDetector slower;
+	for (std::uint16_t port = 1; port <= 360; ++port)
+	{
+		CHECK(!slower.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * 10 * SECOND));
+	}
+}
+
+TEST(fastScanIsNotAlsoReportedAsSlow)
+{
+	ScanDetector detector;
+	int alerts = 0;
+	for (std::uint16_t port = 1; port <= 500; ++port)
+	{
+		if (auto alert = detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * 1000))
+		{
+			CHECK(!alert->slow);
+			++alerts;
+		}
+	}
+	CHECK_EQ(alerts, 1);
+}
+
+TEST(repeatedPortsNeverAddUpToASlowScan)
+{
+	// a client reconnecting to the same 5 ports all day: the slow window counts ports, not SYNs
+	ScanDetector detector;
+	for (int i = 0; i < 5'000; ++i)
+	{
+		const auto port = static_cast<std::uint16_t>(8000 + i % 5);
+		CHECK(!detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), i * SECOND));
+	}
+}
+
+TEST(slowSweepIsCaught)
+{
+	// SSH on one host every 2 s: 10 hosts per 20 s window is under the fast sweep alarm
+	ScanDetector detector;
+	std::optional<ScanAlert> last;
+	for (int host = 1; host <= 120; ++host)
+	{
+		if (auto alert = detector.observe(sshProbe(host), host * 2 * SECOND))
+		{
+			last = alert;
+		}
+	}
+	CHECK(last.has_value());
+	CHECK(last->slow);
+	CHECK(last->kind == ScanKind::HostSweep);
+	CHECK_EQ(last->hosts, std::size_t{100});
+	CHECK_EQ(last->target, std::string("198.51.100.0/24"));
+}
+
+TEST(slowScanSurvivesTheIdleCleanUp)
+{
+	// a scanner pausing 2 minutes between probes: the clean-up must not forget it in between
+	ScanDetector detector(20, 10 * SECOND, 20, 4096, 5);
+	std::optional<ScanAlert> alert;
+	for (std::uint16_t port = 1; port <= 5; ++port)
+	{
+		for (int i = 0; i < 1100; ++i)
+		{
+			detector.observe(DecodedPacket{}, port * 120 * SECOND); // enough packets to run the clean-up
+		}
+		alert = detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * 120 * SECOND);
+	}
+	CHECK(alert.has_value());
+	CHECK(alert->slow);
+}
+
+TEST(slowBannerFitsTheFrame)
+{
+	ScanDetector detector;
+	WatchStatus status;
+	status.sourceLabel = "LIVE";
+	status.alert = ScanAlert{.kind = ScanKind::PortScan, .slow = true, .source = "203.0.113.107",
+		.target = "198.51.100.120", .ports = 1024, .elapsedMicros = 14 * 60 * SECOND};
+	status.sweep = ScanAlert{.kind = ScanKind::HostSweep, .slow = true, .source = "203.0.113.107",
+		.target = "198.51.100.0/24", .port = 3389, .hosts = 254, .elapsedMicros = 14 * 60 * SECOND};
+	const std::string frame = visible(renderWatch(nullptr, status, 0));
+	CHECK(frame.find("SLOW PORT SCAN") != std::string::npos);
+	CHECK(frame.find("SLOW SWEEP") != std::string::npos);
+	CHECK(frame.find("14.0 min") != std::string::npos);
+	CHECK(frame.find("3389/rdp") != std::string::npos);
+	std::size_t start = 0;
+	for (int line = 0; line < WATCH_LINES; ++line)
+	{
+		const std::size_t end = frame.find('\n', start);
+		const std::string text = frame.substr(start, end - start);
+		const auto columns = std::count_if(text.begin(), text.end(),
+			[](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; });
+		CHECK(columns <= std::ptrdiff_t{78});
+		start = end + 1;
+	}
+}
+
+TEST(longIpv6BannersAreCutToTheFrame)
+{
+	WatchStatus status;
+	status.sourceLabel = "LIVE";
+	status.sweep = ScanAlert{.kind = ScanKind::HostSweep, .source = "2001:db8:1234:5678:9abc:def0:1234:5678",
+		.target = "2001:db8:aaaa:bbbb::/64", .port = 22, .hosts = 20, .elapsedMicros = SECOND};
+	const std::string frame = visible(renderWatch(nullptr, status, 0));
+	CHECK_EQ(static_cast<int>(std::count(frame.begin(), frame.end(), '\n')), WATCH_LINES);
+	CHECK(frame.find("…") != std::string::npos);
 	std::size_t start = 0;
 	for (int line = 0; line < WATCH_LINES; ++line)
 	{

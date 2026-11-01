@@ -384,6 +384,46 @@ int visibleWidth(std::string_view text)
 	return width;
 }
 
+/**
+ * WHAT:   Cuts text to a number of visible columns, ending it with "…" if it was longer.
+ * WHY:    A banner wider than the frame would wrap and push every later
+ *         line down; IPv6 addresses and subnets can be very long.
+ *
+ * @param text    the text, possibly with colour escapes
+ * @param columns the most visible columns
+ * @return the text, at most `columns` wide
+ */
+std::string fitWidth(const std::string& text, int columns)
+{
+	if (visibleWidth(text) <= columns)
+	{
+		return text;
+	}
+	std::string out;
+	int width = 0;
+	for (std::size_t i = 0; i < text.size(); ++i)
+	{
+		if (text[i] == '\x1b')
+		{
+			// copy the whole escape sequence; it takes no columns
+			const std::size_t start = i;
+			while (i < text.size() && !(text[i] >= '@' && text[i] <= '~' && text[i] != '['))
+			{
+				++i;
+			}
+			out.append(text, start, i - start + 1);
+			continue;
+		}
+		const bool lead = (static_cast<unsigned char>(text[i]) & 0xC0) != 0x80;
+		if (lead && ++width > columns - 1)
+		{
+			break;
+		}
+		out += text[i];
+	}
+	return out + "…";
+}
+
 /** WHAT: a frame character in the border colour. */
 std::string edge(std::string_view glyph)
 {
@@ -486,6 +526,19 @@ std::string centred(const std::string& text, int width)
 		+ std::string(static_cast<std::size_t>(std::max(0, width - left - static_cast<int>(text.size()))), ' ');
 }
 
+/**
+ * WHAT:   A duration for a banner: "0.8 s" under 90 seconds, otherwise "4.2 min".
+ * WHY:    A slow scan lasts minutes; "252.0 s" is harder to read than "4.2 min".
+ *
+ * @param micros the duration in microseconds
+ * @return the text
+ */
+std::string elapsed(std::int64_t micros)
+{
+	const double seconds = static_cast<double>(micros) / 1e6;
+	return seconds < 90 ? std::format("{:.1f} s", seconds) : std::format("{:.1f} min", seconds / 60);
+}
+
 } // namespace
 
 std::string renderWatch(const ScanTrack* track, const WatchStatus& status, int tick)
@@ -511,7 +564,7 @@ std::string renderWatch(const ScanTrack* track, const WatchStatus& status, int t
 		.cursor = tick % 6 < 3,
 		.probed = probing && tick % 2 == 0,
 		.open = open > 0,
-		.alarm = track != nullptr && track->alerted && (status.finished || tick % 4 < 2),
+		.alarm = track != nullptr && (track->alerted || track->slowAlerted) && (status.finished || tick % 4 < 2),
 	};
 	const std::string side = "    ";
 	out += boxed("");
@@ -587,14 +640,15 @@ std::string renderWatch(const ScanTrack* track, const WatchStatus& status, int t
 
 	// 26-27: the verdicts, as full-width bars: port scans, then host sweeps
 	const auto bar = [&out](const std::string& text, Rgb colour) {
-		const int pad = std::max(0, INNER + 2 - visibleWidth(text));
-		out += bg(colour) + fg(WHITE) + text + std::string(static_cast<std::size_t>(pad), ' ') + std::string(END_LINE);
+		const std::string fitted = fitWidth(text, INNER + 2);
+		const int pad = std::max(0, INNER + 2 - visibleWidth(fitted));
+		out += bg(colour) + fg(WHITE) + fitted + std::string(static_cast<std::size_t>(pad), ' ') + std::string(END_LINE);
 	};
 	if (status.alert)
 	{
 		const ScanAlert& alert = *status.alert;
-		bar(std::format("\x1b[1m PORT SCAN DETECTED \x1b[22m {} → {} · {} ports in {:.1f} s",
-			alert.source, alert.target, alert.ports, static_cast<double>(alert.elapsedMicros) / 1e6), ALARM_BG);
+		bar(std::format("\x1b[1m {} \x1b[22m {} → {} · {} ports in {}", alert.slow ? "SLOW PORT SCAN" : "PORT SCAN DETECTED",
+			alert.source, alert.target, alert.ports, elapsed(alert.elapsedMicros)), ALARM_BG);
 	}
 	else
 	{
@@ -604,9 +658,9 @@ std::string renderWatch(const ScanTrack* track, const WatchStatus& status, int t
 	{
 		const ScanAlert& sweep = *status.sweep;
 		const std::string name = serviceName(sweep.port);
-		bar(std::format("\x1b[1m HOST SWEEP \x1b[22m {} → {} · port {}{}{} · {} hosts in {:.1f} s",
-			sweep.source, sweep.target, sweep.port, name.empty() ? "" : " ", name, sweep.hosts,
-			static_cast<double>(sweep.elapsedMicros) / 1e6), ALARM_BG);
+		bar(std::format("\x1b[1m {} \x1b[22m {} → {} · {}{}{} · {} hosts in {}", sweep.slow ? "SLOW SWEEP" : "HOST SWEEP",
+			sweep.source, sweep.target, sweep.port, name.empty() ? "" : "/", name, sweep.hosts,
+			elapsed(sweep.elapsedMicros)), ALARM_BG);
 	}
 	else
 	{

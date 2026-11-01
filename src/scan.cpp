@@ -8,9 +8,6 @@ namespace wiresight
 namespace
 {
 
-/** WHAT: a pair or sweep quiet for this long is forgotten (unless it is the busiest pair). */
-constexpr std::int64_t IDLE_MICROS = 60'000'000;
-
 /** WHAT: idle entries are looked for once every this many packets. */
 constexpr std::size_t CLEANUP_EVERY = 1024;
 
@@ -63,8 +60,9 @@ std::size_t ScanTrack::count(PortState state) const
 }
 
 ScanDetector::ScanDetector(std::size_t threshold, std::int64_t windowMicros, std::size_t sweepThreshold,
-	std::size_t maxTracked)
-	: threshold_(threshold), windowMicros_(windowMicros), sweepThreshold_(sweepThreshold), maxTracked_(maxTracked)
+	std::size_t maxTracked, std::size_t slowThreshold, std::int64_t slowWindowMicros)
+	: threshold_(threshold), windowMicros_(windowMicros), sweepThreshold_(sweepThreshold), maxTracked_(maxTracked),
+	  slowThreshold_(slowThreshold), slowWindowMicros_(slowWindowMicros)
 {
 }
 
@@ -175,13 +173,21 @@ std::optional<ScanAlert> ScanDetector::probePair(const std::string& from, const 
 	}
 
 	const std::size_t distinct = track.recent.add(timeMicros, port, windowMicros_);
-	if (track.alerted || distinct < threshold_)
+	const std::size_t slow = track.slow.add(timeMicros, port, slowWindowMicros_);
+	if (!track.alerted && distinct >= threshold_)
 	{
-		return std::nullopt;
+		track.alerted = true;
+		return ScanAlert{.kind = ScanKind::PortScan, .source = track.source, .target = track.target,
+			.ports = distinct, .elapsedMicros = timeMicros - track.recent.oldest()};
 	}
-	track.alerted = true;
-	return ScanAlert{.kind = ScanKind::PortScan, .source = track.source, .target = track.target, .ports = distinct,
-		.elapsedMicros = timeMicros - track.recent.oldest()};
+	// the slow rule: only for a pair the fast rule has not already reported
+	if (!track.alerted && !track.slowAlerted && slow >= slowThreshold_)
+	{
+		track.slowAlerted = true;
+		return ScanAlert{.kind = ScanKind::PortScan, .slow = true, .source = track.source, .target = track.target,
+			.ports = slow, .elapsedMicros = timeMicros - track.slow.oldest()};
+	}
+	return std::nullopt;
 }
 
 std::optional<ScanAlert> ScanDetector::probeSweep(const std::string& from, const std::string& to,
@@ -197,13 +203,20 @@ std::optional<ScanAlert> ScanDetector::probeSweep(const std::string& from, const
 	sweep.lastMicros = timeMicros;
 
 	const std::size_t hosts = sweep.recent.add(timeMicros, to, windowMicros_);
-	if (sweep.alerted || hosts < sweepThreshold_)
+	const std::size_t slow = sweep.slow.add(timeMicros, to, slowWindowMicros_);
+	if (!sweep.alerted && hosts >= sweepThreshold_)
 	{
-		return std::nullopt;
+		sweep.alerted = true;
+		return ScanAlert{.kind = ScanKind::HostSweep, .source = sweep.source, .target = sweep.subnet, .port = port,
+			.hosts = hosts, .elapsedMicros = timeMicros - sweep.recent.oldest()};
 	}
-	sweep.alerted = true;
-	return ScanAlert{.kind = ScanKind::HostSweep, .source = sweep.source, .target = sweep.subnet, .port = port,
-		.hosts = hosts, .elapsedMicros = timeMicros - sweep.recent.oldest()};
+	if (!sweep.alerted && !sweep.slowAlerted && slow >= slowThreshold_)
+	{
+		sweep.slowAlerted = true;
+		return ScanAlert{.kind = ScanKind::HostSweep, .slow = true, .source = sweep.source, .target = sweep.subnet,
+			.port = port, .hosts = slow, .elapsedMicros = timeMicros - sweep.slow.oldest()};
+	}
+	return std::nullopt;
 }
 
 const ScanTrack* ScanDetector::busiest() const
@@ -239,9 +252,10 @@ void ScanDetector::forgetIdle(std::int64_t nowMicros)
 		}
 	};
 	forget(pairs_, [&](const ScanTrack& track) {
-		return &track != busiest_ && std::max(track.lastProbeMicros, track.lastReplyMicros) < nowMicros - IDLE_MICROS;
+		return &track != busiest_
+			&& std::max(track.lastProbeMicros, track.lastReplyMicros) < nowMicros - slowWindowMicros_;
 	});
-	forget(sweeps_, [&](const SweepTrack& sweep) { return sweep.lastMicros < nowMicros - IDLE_MICROS; });
+	forget(sweeps_, [&](const SweepTrack& sweep) { return sweep.lastMicros < nowMicros - slowWindowMicros_; });
 }
 
 } // namespace wiresight

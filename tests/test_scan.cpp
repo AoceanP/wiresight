@@ -113,10 +113,12 @@ TEST(scanIgnoresManyConnectionsToOnePort)
 TEST(scanIgnoresSlowProbesOutsideTheWindow)
 {
 	// one new port every second against a 10-second window never reaches 20 at once
+	// (the slow rule reports it instead: see slowScanIsCaughtUnderTheFastAlarm)
 	ScanDetector detector(20, 10 * SECOND);
 	for (std::uint16_t port = 1; port <= 100; ++port)
 	{
-		CHECK(!detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * SECOND));
+		const auto alert = detector.observe(tcp(SCANNER, TARGET, 40000, port, tcp_flag::SYN), port * SECOND);
+		CHECK(!alert || alert->slow);
 	}
 }
 
@@ -178,10 +180,10 @@ TEST(scanForgetsIdlePairsButKeepsTheBusiest)
 	}
 	detector.observe(tcp({192, 0, 2, 1}, TARGET, 40000, 80, tcp_flag::SYN), 0);
 	CHECK_EQ(detector.tracked(), std::size_t{2});
-	// over a thousand quiet packets two minutes later trigger the clean-up
+	// over a thousand quiet packets 20 minutes later (past the 15-minute slow window) trigger the clean-up
 	for (int i = 0; i < 1100; ++i)
 	{
-		detector.observe(DecodedPacket{}, 120 * SECOND);
+		detector.observe(DecodedPacket{}, 20 * 60 * SECOND);
 	}
 	CHECK_EQ(detector.tracked(), std::size_t{1});
 	CHECK_EQ(detector.busiest()->source, std::string("203.0.113.7"));

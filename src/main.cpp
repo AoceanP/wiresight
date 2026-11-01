@@ -57,6 +57,7 @@ constexpr std::string_view USAGE = R"(usage: wiresight [options]
       --demo             play a built-in port scan in the scan watch (no capture, no admin rights)
       --scan-threshold N distinct ports from one address within 10 s that count as a scan (default 20)
       --sweep-threshold N hosts of one subnet probed on one port within 10 s that count as a sweep (default 20)
+      --slow-threshold N different ports (or hosts) within 15 min that count as a slow scan (default 100)
       --version          show the version and the capture library
   -h, --help             show this help
 
@@ -101,6 +102,8 @@ struct Options
 	std::size_t scanThreshold = 20;
 	/** WHAT: the value of --sweep-threshold. */
 	std::size_t sweepThreshold = 20;
+	/** WHAT: the value of --slow-threshold. */
+	std::size_t slowThreshold = 100;
 	/** WHAT: --help was given, or no arguments at all. */
 	bool help = false;
 	/** WHAT: the value of --interface, or "". */
@@ -199,6 +202,16 @@ Options parseArguments(int argc, char** argv)
 				throw UsageError("--sweep-threshold needs a whole number of 2 or more, got '" + text + "'");
 			}
 			options.sweepThreshold = *threshold;
+		}
+		else if (argument == "--slow-threshold")
+		{
+			const std::string text = value();
+			const auto threshold = parsePositive(text);
+			if (!threshold || *threshold < 2)
+			{
+				throw UsageError("--slow-threshold needs a whole number of 2 or more, got '" + text + "'");
+			}
+			options.slowThreshold = *threshold;
 		}
 		else if (argument == "-h" || argument == "--help") options.help = true;
 		else if (argument == "-c" || argument == "--count")
@@ -318,7 +331,8 @@ public:
 	 * @param sourceLabel "LIVE", "FILE" or "DEMO", shown in the title
 	 */
 	Watcher(const Options& options, std::string sourceLabel)
-		: options_(options), detector_(options.scanThreshold, 10'000'000, options.sweepThreshold)
+		: options_(options),
+		  detector_(options.scanThreshold, 10'000'000, options.sweepThreshold, 4096, options.slowThreshold)
 	{
 		status_.sourceLabel = std::move(sourceLabel);
 		if (options_.watch)
@@ -376,13 +390,14 @@ public:
 		}
 		if (alert && alert->kind == ScanKind::PortScan)
 		{
-			std::cout << std::format("!!  PORT SCAN  {} -> {}: {} ports in {:.2f} s\n", alert->source, alert->target,
-				alert->ports, static_cast<double>(alert->elapsedMicros) / 1e6);
+			std::cout << std::format("!!  {}PORT SCAN  {} -> {}: {} ports in {:.2f} s\n", alert->slow ? "SLOW " : "",
+				alert->source, alert->target, alert->ports, static_cast<double>(alert->elapsedMicros) / 1e6);
 		}
 		else if (alert)
 		{
-			std::cout << std::format("!!  HOST SWEEP  {} -> {} port {}: {} hosts in {:.2f} s\n", alert->source,
-				alert->target, alert->port, alert->hosts, static_cast<double>(alert->elapsedMicros) / 1e6);
+			std::cout << std::format("!!  {}HOST SWEEP  {} -> {} port {}: {} hosts in {:.2f} s\n",
+				alert->slow ? "SLOW " : "", alert->source, alert->target, alert->port, alert->hosts,
+				static_cast<double>(alert->elapsedMicros) / 1e6);
 		}
 		std::cout.flush();
 	}

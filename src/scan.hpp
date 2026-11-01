@@ -7,6 +7,7 @@
 #include <list>
 #include <map>
 #include <optional>
+#include <unordered_set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -90,6 +91,63 @@ private:
 };
 
 /**
+ * WHAT:   Counts the distinct keys first seen within a long sliding window.
+ * WHY:    The slow rules look back 15 minutes. Keeping every event for that
+ *         long (as DistinctWindow does) would let a flood of repeated SYNs
+ *         grow memory; here a key is stored once, when first seen, and
+ *         expires one window later. Memory is bounded by the number of
+ *         distinct keys (at most 65,535 ports), whatever the packet rate.
+ *
+ * @tparam Key the thing counted (a port number or an address)
+ */
+template <typename Key>
+class FirstSeenWindow
+{
+public:
+	/**
+	 * WHAT:   Expires keys first seen before the window, then adds this key if it is new.
+	 * PRE:    times do not go backwards by more than the window
+	 * RETURN: how many distinct keys were first seen inside the window
+	 *
+	 * @param timeMicros   the event time
+	 * @param key          the event's key
+	 * @param windowMicros the window length
+	 * @return the distinct count
+	 */
+	std::size_t add(std::int64_t timeMicros, const Key& key, std::int64_t windowMicros)
+	{
+		while (!order_.empty() && order_.front().first < timeMicros - windowMicros)
+		{
+			keys_.erase(order_.front().second);
+			order_.pop_front();
+		}
+		if (keys_.insert(key).second)
+		{
+			order_.emplace_back(timeMicros, key);
+		}
+		return keys_.size();
+	}
+
+	/**
+	 * WHAT:   The time the oldest counted key was first seen.
+	 * PRE:    add() has been called at least once
+	 * RETURN: microseconds
+	 *
+	 * @return the oldest time
+	 */
+	std::int64_t oldest() const
+	{
+		return order_.front().first;
+	}
+
+private:
+	/** WHAT: (first-seen time, key), oldest first; one entry per key. */
+	std::deque<std::pair<std::int64_t, Key>> order_;
+	/** WHAT: the keys currently counted. */
+	std::unordered_set<Key> keys_;
+};
+
+/**
  * WHAT:   Everything seen between one scanner and one target.
  * WHY:    A scan is a conversation between two addresses, so tracking the
  *         pair lets the alert and the watch view say who scanned whom.
@@ -116,8 +174,12 @@ struct ScanTrack
 	std::map<std::uint16_t, PortState> ports;
 	/** WHAT: an alert has been raised for this pair. */
 	bool alerted = false;
+	/** WHAT: a slow-scan alert has been raised for this pair. */
+	bool slowAlerted = false;
 	/** WHAT: the ports probed inside the detection window. */
 	DistinctWindow<std::uint16_t> recent;
+	/** WHAT: the ports first probed inside the slow window. */
+	FirstSeenWindow<std::uint16_t> slow;
 
 	/**
 	 * WHAT:   Counts the ports in one state.
@@ -146,8 +208,12 @@ struct SweepTrack
 	std::int64_t lastMicros = 0;
 	/** WHAT: an alert has been raised for this sweep. */
 	bool alerted = false;
+	/** WHAT: a slow-sweep alert has been raised for this sweep. */
+	bool slowAlerted = false;
 	/** WHAT: the hosts probed inside the detection window. */
 	DistinctWindow<std::string> recent;
+	/** WHAT: the hosts first probed inside the slow window. */
+	FirstSeenWindow<std::string> slow;
 };
 
 /**
@@ -170,6 +236,8 @@ struct ScanAlert
 {
 	/** WHAT: port scan or host sweep. */
 	ScanKind kind = ScanKind::PortScan;
+	/** WHAT: found by the slow window: probes spread out to stay under the fast alarm. */
+	bool slow = false;
 	/** WHAT: the scanner's address. */
 	std::string source;
 	/** WHAT: the scanned address, or the swept subnet for a sweep. */
@@ -197,6 +265,12 @@ struct ScanAlert
  *         internet, while a sweep walks one network. Counting is incremental,
  *         so a full 65,535-port scan costs the same per packet as a small one.
  *
+ *         Patient scanners pace themselves under that window (portscout
+ *         --rate 1 sends 10 probes in 10 s, half the threshold), so a
+ *         second, slow window looks back 15 minutes: 100 different ports,
+ *         or hosts, in that time is a slow scan. A pair or sweep already
+ *         reported by the fast rule is not reported again as slow.
+ *
  *         The detector also defends itself: every SYN from a new address
  *         creates a record, so a flood of SYNs from forged addresses could
  *         otherwise grow memory without limit. At most maxTracked pairs and
@@ -209,15 +283,20 @@ class ScanDetector
 public:
 	/**
 	 * WHAT:   Creates a detector.
-	 * PRE:    threshold >= 2, windowMicros > 0, sweepThreshold >= 2, maxTracked >= 2
+	 * PRE:    threshold >= 2, windowMicros > 0, sweepThreshold >= 2, maxTracked >= 2,
+	 *         slowThreshold >= 2, slowWindowMicros > windowMicros
 	 *
-	 * @param threshold      distinct ports in the window that raise a port-scan alert
-	 * @param windowMicros   the window length, in microseconds
-	 * @param sweepThreshold distinct hosts of one subnet in the window that raise a sweep alert
-	 * @param maxTracked     the most pairs (and, separately, sweeps) remembered at once
+	 * @param threshold        distinct ports in the window that raise a port-scan alert
+	 * @param windowMicros     the window length, in microseconds
+	 * @param sweepThreshold   distinct hosts of one subnet in the window that raise a sweep alert
+	 * @param maxTracked       the most pairs (and, separately, sweeps) remembered at once
+	 * @param slowThreshold    distinct ports (or hosts) in the slow window that raise a slow alert
+	 * @param slowWindowMicros the slow window length, in microseconds; also how long a quiet
+	 *                         pair or sweep is remembered
 	 */
 	explicit ScanDetector(std::size_t threshold = 20, std::int64_t windowMicros = 10'000'000,
-		std::size_t sweepThreshold = 20, std::size_t maxTracked = 4096);
+		std::size_t sweepThreshold = 20, std::size_t maxTracked = 4096, std::size_t slowThreshold = 100,
+		std::int64_t slowWindowMicros = 15 * 60'000'000LL);
 
 	/**
 	 * WHAT:   Looks at one packet; only TCP SYN, SYN-ACK and RST matter.
@@ -299,6 +378,10 @@ private:
 	std::size_t sweepThreshold_;
 	/** WHAT: the most pairs, and the most sweeps, kept at once. */
 	std::size_t maxTracked_;
+	/** WHAT: distinct ports or hosts in the slow window that raise a slow alert. */
+	std::size_t slowThreshold_;
+	/** WHAT: how far back the slow counts look, and how long quiet entries are kept. */
+	std::int64_t slowWindowMicros_;
 	/** WHAT: entries dropped because a table was full. */
 	std::size_t dropped_ = 0;
 	/** WHAT: packets seen since the last clean-up of idle entries. */
@@ -346,9 +429,10 @@ private:
 		std::uint16_t port, std::int64_t timeMicros);
 
 	/**
-	 * WHAT:   Forgets pairs and sweeps that have been quiet for a minute.
+	 * WHAT:   Forgets pairs and sweeps that have been quiet for a whole slow window.
 	 * WHY:    Keeps memory small on a long capture: every connection
-	 *         ever made would otherwise stay in the map.
+	 *         ever made would otherwise stay in the map. Quiet for less than
+	 *         the slow window could still be a slow scan pausing between probes.
 	 *
 	 * @param nowMicros the current capture time
 	 */
